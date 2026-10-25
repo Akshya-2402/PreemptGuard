@@ -1,0 +1,246 @@
+import unittest
+import tempfile
+from pathlib import Path
+
+from app.core.database import Database
+from app.experiments.metrics import summarize_run
+from app.api.experiments import summarize_policies
+from app.monitoring.features import extract_features
+from app.prediction.risk_estimator import estimate_risk
+from app.recovery.decision_engine import choose_action
+from app.schemas import SettingsUpdate, validate_settings_update
+
+
+class FeatureTests(unittest.TestCase):
+    def test_empty_history_returns_safe_features(self):
+        features = extract_features([])
+        self.assertEqual(features["history_samples"], 0)
+        self.assertEqual(features["responsive"], 0)
+
+    def test_features_use_only_supplied_past_samples(self):
+        samples = [
+            {
+                "process_state": "running",
+                "cpu_percent": value,
+                "memory_mb": 20 + value,
+                "memory_growth_mb_s": 1.0 + value / 10,
+                "responsive": 1,
+            }
+            for value in (10, 20, 30, 50)
+        ]
+        features = extract_features(samples)
+        self.assertEqual(features["history_samples"], 4)
+        self.assertEqual(features["cpu_current"], 50)
+        self.assertGreater(features["cpu_trend"], 0)
+        self.assertEqual(features["memory_current_mb"], 70)
+
+    def test_features_include_recent_failures_and_restarts(self):
+        sample = {
+            "process_state": "running",
+            "cpu_percent": 0.0,
+            "memory_mb": 20.0,
+            "memory_growth_mb_s": 0.0,
+            "responsive": 1,
+            "recent_failure_count": 2,
+            "recent_restart_count": 3,
+        }
+        features = extract_features([sample])
+        self.assertEqual(features["recent_failures"], 2)
+        self.assertEqual(features["recent_restarts"], 3)
+
+
+class RiskAndDecisionTests(unittest.TestCase):
+    def test_risk_has_bounded_score_and_explanation(self):
+        prediction = estimate_risk(
+            "managed-id",
+            {
+                "cpu_mean": 90, "cpu_trend": 20,
+                "memory_growth_mb_s": 3, "memory_acceleration_mb_s2": 1,
+                "missed_heartbeats": 1, "abnormal_samples": 5,
+                "history_samples": 10,
+            },
+            30, 0.35, 0.65,
+        )
+        self.assertGreaterEqual(prediction.risk_score, 0)
+        self.assertLessEqual(prediction.risk_score, 1)
+        self.assertTrue(prediction.contributors)
+        self.assertIn("uncalibrated", prediction.model_name)
+
+    def test_low_confidence_requests_recheck(self):
+        decision = choose_action(
+            policy="preemptguard", risk_score=0.4, confidence=0.3,
+            low_threshold=0.35, high_threshold=0.65, responsive=True,
+            failed=False, restart_count=0, restart_limit=3,
+        )
+        self.assertEqual(decision.action, "recheck")
+
+    def test_temporary_stale_heartbeat_rechecks_before_restart(self):
+        decision = choose_action(
+            policy="preemptguard", risk_score=0.4, confidence=0.6,
+            low_threshold=0.35, high_threshold=0.65, responsive=False,
+            failed=False, restart_count=0, restart_limit=3,
+            confirmed_unresponsive=False,
+        )
+        self.assertEqual(decision.action, "recheck")
+
+    def test_restart_limit_prevents_retry(self):
+        decision = choose_action(
+            policy="preemptguard", risk_score=1, confidence=0.9,
+            low_threshold=0.35, high_threshold=0.65, responsive=False,
+            failed=True, restart_count=3, restart_limit=3,
+        )
+        self.assertEqual(decision.action, "investigate")
+
+    def test_confirmed_unresponsive_process_restarts_when_allowed(self):
+        decision = choose_action(
+            policy="preemptguard", risk_score=0.7, confidence=0.7,
+            low_threshold=0.35, high_threshold=0.65, responsive=False,
+            failed=False, restart_count=0, restart_limit=3,
+            confirmed_unresponsive=True,
+        )
+        self.assertEqual(decision.action, "restart")
+
+    def test_temporary_operation_failure_retries_before_restart(self):
+        decision = choose_action(
+            policy="preemptguard", risk_score=0.1, confidence=0.7,
+            low_threshold=0.35, high_threshold=0.65, responsive=True,
+            failed=False, restart_count=0, restart_limit=3,
+            workload_type="temporary_io", operation_status="failed",
+            operation_retry_count=0, max_operation_retries=2,
+        )
+        self.assertEqual(decision.action, "retry")
+
+    def test_sustained_cpu_workload_is_throttled_once(self):
+        decision = choose_action(
+            policy="preemptguard", risk_score=0.5, confidence=0.7,
+            low_threshold=0.35, high_threshold=0.65, responsive=True,
+            failed=False, restart_count=0, restart_limit=3,
+            workload_type="cpu", cpu_overloaded=True, throttled=False,
+        )
+        self.assertEqual(decision.action, "throttle")
+
+    def test_confidence_ablation_rechecks_below_configured_minimum(self):
+        decision = choose_action(
+            policy="confidence_recheck", risk_score=0.9, confidence=0.4,
+            low_threshold=0.35, high_threshold=0.65, responsive=True,
+            failed=False, restart_count=0, restart_limit=3,
+            minimum_confidence=0.6,
+        )
+        self.assertEqual(decision.action, "recheck")
+
+    def test_baselines_have_distinct_rules(self):
+        fixed = choose_action(
+            policy="fixed", risk_score=0.9, confidence=0.9,
+            low_threshold=0.35, high_threshold=0.65, responsive=True,
+            failed=False, restart_count=0, restart_limit=3,
+        )
+        threshold = choose_action(
+            policy="threshold", risk_score=0.1, confidence=0.9,
+            low_threshold=0.35, high_threshold=0.65, responsive=True,
+            failed=False, restart_count=0, restart_limit=3,
+            threshold_detected=True,
+        )
+        self.assertEqual(fixed.action, "continue monitoring")
+        self.assertEqual(threshold.action, "restart")
+
+
+class MetricTests(unittest.TestCase):
+    def test_policy_summary_reports_mean_spread_and_available_count(self):
+        rows = [
+            {"policy": "threshold", "metrics": {"f1": 0.4, "precision": None}},
+            {"policy": "threshold", "metrics": {"f1": 0.6, "precision": 0.5}},
+        ]
+        summary = summarize_policies(rows)[0]
+        self.assertEqual(summary["run_count"], 2)
+        self.assertEqual(summary["metrics"]["f1"]["mean"], 0.5)
+        self.assertAlmostEqual(summary["metrics"]["f1"]["std"], 0.1)
+        self.assertEqual(summary["metrics"]["precision"]["n"], 1)
+        self.assertEqual(summary["metrics"]["precision"]["std"], 0.0)
+
+    def test_metrics_mark_unlabeled_runs_as_unavailable(self):
+        result = summarize_run([], [], [], horizon_s=30)
+        self.assertIsNone(result["precision"])
+        self.assertEqual(result["unnecessary_restarts"], 0)
+        self.assertEqual(result["sample_count"], 0)
+        self.assertIsNone(result["recovery_success_rate"])
+
+
+    def test_metrics_use_failure_horizon(self):
+        measurements = [
+            {"timestamp": 10.0, "process_state": "running"},
+            {"timestamp": 31.0, "process_state": "failed"},
+        ]
+        predictions = [
+            {"timestamp": 0.0, "risk_score": 0.8},
+            {"timestamp": 10.0, "risk_score": 0.8},
+            {"timestamp": 20.0, "risk_score": 0.1},
+        ]
+        result = summarize_run(measurements, predictions, [], horizon_s=30)
+        self.assertEqual(result["true_positives"], 1)
+        self.assertEqual(result["false_negatives"], 1)
+        self.assertEqual(result["false_positive_rate"], 1)
+        self.assertEqual(result["first_early_warning_lead_time_s"], 21.0)
+
+    def test_metrics_exclude_predictions_at_or_during_observed_failure(self):
+        measurements = [
+            {"timestamp": 0.0, "process_state": "running", "responsive": 1},
+            {"timestamp": 10.0, "process_state": "failed", "responsive": 0},
+            {"timestamp": 20.0, "process_state": "running", "responsive": 1},
+            {"timestamp": 50.0, "process_state": "running", "responsive": 1},
+        ]
+        predictions = [
+            {"timestamp": 0.0, "risk_score": 0.9},
+            {"timestamp": 10.0, "risk_score": 1.0},
+            {"timestamp": 20.0, "risk_score": 0.1},
+        ]
+        result = summarize_run(measurements, predictions, [], horizon_s=30)
+        self.assertEqual(result["true_positives"], 1)
+        self.assertEqual(result["false_positives"], 0)
+        self.assertEqual(result["true_negatives"], 1)
+        self.assertEqual(result["labeled_prediction_samples"], 2)
+
+    def test_metrics_report_recovery_rates_and_complete_unnecessary_restart_window(self):
+        measurements = [
+            {"timestamp": 10.0, "process_state": "running", "responsive": 1},
+            {"timestamp": 11.0, "process_state": "running", "responsive": 1},
+            {"timestamp": 12.0, "process_state": "running", "responsive": 1},
+            {"timestamp": 13.0, "process_state": "running", "responsive": 1},
+        ]
+        recoveries = [
+            {"timestamp": 10.0, "duration_s": 1.0, "status": "healthy"},
+            {"timestamp": 12.0, "duration_s": 3.0, "status": "failed"},
+        ]
+        result = summarize_run(
+            measurements, [], recoveries, horizon_s=3,
+            post_recovery_observation_s=1,
+        )
+        self.assertEqual(result["recovery_success_rate"], 0.5)
+        self.assertEqual(result["mean_recovery_time_s"], 2.0)
+        self.assertEqual(result["median_recovery_time_s"], 2.0)
+        self.assertEqual(result["unnecessary_restarts"], 1)
+
+
+class PersistenceAndValidationTests(unittest.TestCase):
+    def test_settings_are_validated_as_a_pair(self):
+        with self.assertRaises(ValueError):
+            validate_settings_update(SettingsUpdate(
+                low_risk_threshold=0.8,
+                high_risk_threshold=0.7,
+            ))
+
+    def test_database_persists_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            db.execute(
+                "INSERT INTO app_settings(key,value) VALUES(?,?)",
+                ("prediction_horizon", "45"),
+            )
+            self.assertEqual(
+                db.query("SELECT value FROM app_settings WHERE key=?", ("prediction_horizon",))[0]["value"],
+                "45",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
